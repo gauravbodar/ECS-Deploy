@@ -1,0 +1,60 @@
+New Repository 
+---------------------
+param (
+[Parameter(Mandatory=$true)]
+[string]$awsproxy,
+[Parameter(Mandatory=$true)]
+[string]$env,
+[Parameter(Mandatory=$true)]
+[string]$tags,
+[Parameter(Mandatory=$true)]
+[string[]]$appname
+)
+
+#set proxy
+$env:HTTPS_PROXY = $awsproxy
+$tags = $tags.Replace('key','Key')
+$tags = $tags.Replace('value','Value')
+
+foreach ($app in $appname) {
+	#Generate Variable
+	$ecrname = $app.Replace('-','') + "-" + $envstack.ToLower()
+	$ecr = (aws ecr describe-repositories | convertfrom-json).repositories | Where-Object -Property repositoryName -eq $ecrname
+	
+	
+	if ($ecr) {
+		write-output "$ecrname ECR Repository already Exist - Skipping creation"
+	}
+	else {
+		write-output "$ecrname ECR Repository does not exist - Attempting Creation"
+		
+		$newecrscriptblock = "aws ecr create-repository --repository-name $ecrname"
+		try {
+			Invoke-Expression $newecrscriptblock | out-null
+		}
+		catch {
+			Write-error -Message $PSItem
+		}
+		
+		$ecr = (aws ecr describe-repositories | convertfrom-json).repositories | Where-Object -Property repositoryName -eq $ecrname
+        
+        if ($ecr) {
+            #set Tags
+            $tagsscriptblock = "aws ecr tag-resource --resource-arn $($ecr.repositoryArn) --tags $tags"
+            try {
+                Invoke-Expression $tagsscriptblock | out-null
+            }
+            catch {
+                Write-error -Message $PSItem
+            }
+        }		
+
+		if ($ecr) {
+			write-output "Successfully created new ECR Repository $ecrname"
+		}
+		else {
+			write-error "Failed to create new ECR Repository $ecrname"
+		}
+	}
+	$ecr = $null
+}

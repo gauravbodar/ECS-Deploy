@@ -1,0 +1,48 @@
+param (
+[Parameter(Mandatory=$true)]
+[string]$awsproxy,
+[Parameter(Mandatory=$true)]
+[string]$env,
+[Parameter(Mandatory=$true)]
+[string]$tags,
+[Parameter(Mandatory=$true)]
+[string[]]$appname
+)
+
+#set proxy
+$env:HTTPS_PROXY = $awsproxy
+$tags = $tags.Replace('key','Key')
+$tags = $tags.Replace('value','Value')
+$tags = "'$tags'"
+
+foreach ($app in $appname) {
+	#Generate Variable
+	$logname = "/ecs/" + $app.Replace('-','') + "-" + ($env).ToLower()
+	$logs = (aws logs describe-log-groups --log-group-name-prefix $logname | convertfrom-json).loggroups.loggroupname
+	
+	
+	if ($logs) {
+		write-output "$logname Logs already Exist - Skipping creation"
+	}
+	else {
+		write-output "Log group does not exist - Attempting Creation"
+		
+		$newlogscriptblock = "aws logs create-log-group --log-group-name $logname --tags $tags"
+		try {
+			Invoke-Expression $newlogscriptblock
+		}
+		catch {
+			Write-error -Message $PSItem
+		}
+		
+		$logs = (aws logs describe-log-groups --log-group-name-prefix $logname | convertfrom-json).loggroups.loggroupname
+		
+		if ($logs) {
+			write-output "Successfully created new log group $logname"
+		}
+		else {
+			write-error "Failed to create new log group $logname"
+		}
+	}
+	$logs = $null
+}

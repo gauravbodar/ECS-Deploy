@@ -1,0 +1,260 @@
+Param(
+[Parameter(Mandatory=$true)]
+$awsproxy,
+[Parameter(Mandatory=$true)]
+$appname,
+[Parameter(Mandatory=$true)]
+$env,
+[Parameter(Mandatory=$true)]
+$tags,
+[Parameter(Mandatory=$false)]
+$vpcid,
+[Parameter(Mandatory=$false)]
+$subnets,
+[Parameter(Mandatory=$true)]
+[string]$Port,
+[Parameter(Mandatory=$true)]
+[string]$targetgrouppath,
+[Parameter(Mandatory=$true)]
+$securitygroup
+)
+
+#Generate Variablesfrom Params
+$lbname = $appname.Replace('-','') + "-" + ($env).ToLower() + "-alb"
+$targetgroupname = $appname.Replace('-','') + "-" + ($env).ToLower() + "-group"
+$env:HTTPS_PROXY = $awsproxy
+$tags = $tags.Replace('key','Key')
+$tags = $tags.Replace('value','Value')
+
+
+#Build Variable Hash Table
+$lbhashtable = @{}
+
+if ($appname -ne $null) {
+    $lbhashtable.add("TargetGroupName","$targetgroupname")
+    $lbhashtable.add("TargetGroupType","ip")
+    $lbhashtable.add("TargetGroupProtocol","HTTP")
+    $lbhashtable.add("TargetGroupPort","$Port")
+    $lbhashtable.add("TargetGroupHcheckProto","HTTP")
+    $lbhashtable.add("TargetGroupHcheckPort","$Port")
+    $lbhashtable.add("TargetGroupHcheckEnb","True")
+    $lbhashtable.add("TargetGroupHcheckInt","30")
+    $lbhashtable.add("TargetGroupHcheckTimeOut","5")
+    $lbhashtable.add("TargetGroupHcheckThreshold","2")
+    $lbhashtable.add("TargetGroupUnhealthThreshold","10")
+    $lbhashtable.add("TargetGroupPath","$targetgrouppath")    
+}
+else {
+    write-error "Expected an appname of <APPNAME> other appname not currently support"
+}
+
+#Supporting functions
+function new-awsintlb {
+    [CmdletBinding()]
+    Param(
+    [Parameter(Mandatory=$true)]
+    [string]$lbname,
+    [Parameter(Mandatory=$true)]
+    [string]$subnets,
+    [Parameter(Mandatory=$true)]
+    [string]$securitygroup
+    )
+    
+    $ALBscriptblock = "aws elbv2 create-load-balancer --name $lbname --scheme internal --subnets $subnets --tags $tags --security-group $securitygroup"
+    try {
+        Invoke-expression $ALBscriptblock | out-null
+    }
+    catch {
+        Write-error -Message $PSItem
+    }
+    start-sleep 5
+    $currentlbstatus = (aws elbv2 describe-load-balancers | convertfrom-json).loadbalancers | Where-Object -Property loadbalancername -eq $lbname
+    if ($currentlbstatus) {
+        write-host "New Load Balancer $lbname created, awaiting it to provision"
+        
+        #Set Provisioning Timeout
+        $timeout = new-timespan -Minutes 5
+        $sw = [diagnostics.stopwatch]::StartNew()
+        do {
+            $provision = (aws elbv2 describe-load-balancers --name $lbname| convertfrom-json).loadbalancers | Where-Object -Property loadbalancername -eq $lbname
+            start-sleep 25
+            if ($sw.elapsed -gt $timeout) {
+                write-error "Failed to provision new load balancer $lbname in $timeout.Minutes"
+            }
+            write-host "$lbname state - $($provision.state.code) - Please Wait"
+        } until ($provision.State.Code -eq "active")
+        #Stop stopwatch
+        $sw.Stop()
+        
+        write-host "successfully built new Internal Load Balancer $lbname"
+        
+    } 
+    else {
+        write-error "failed to build $lbname"
+    }
+}
+
+
+function new-awstargetgroup {
+    Param(
+    [Parameter(Mandatory=$true)]
+    [PSCustomObject]$lb,
+    [Parameter(Mandatory=$true)]
+    [Hashtable]$lbhashtable,
+    [Parameter(Mandatory=$true)]
+    [string]$vpcid
+    )
+    
+    $Targetscriptblock = "aws elbv2 create-target-group --name $($lbhashtable.TargetGroupName) --protocol $($lbhashtable.TargetGroupProtocol) --port $($lbhashtable.TargetGroupPort) --vpc-id $vpcid --target-type $($lbhashtable.TargetGroupType) --health-check-protocol $($lbhashtable.TargetGroupHcheckProto) --health-check-port $($lbhashtable.TargetGroupPort) --health-check-enabled --health-check-path $($lbhashtable.TargetGroupPath) --health-check-interval-seconds $($lbhashtable.TargetGroupHcheckInt) --health-check-timeout-seconds $($lbhashtable.TargetGroupHcheckTimeOut) --healthy-threshold-count $($lbhashtable.TargetGroupHcheckThreshold) --unhealthy-threshold-count $($lbhashtable.TargetGroupUnhealthThreshold)"
+    try {
+        Invoke-Expression $Targetscriptblock | out-null
+    }
+    catch {
+        Write-error -Message $PSItem
+    }
+    
+    #Confirm Successful and pass Variable forward to listener function
+    $targetgroup = (aws elbv2 describe-target-groups | convertfrom-json).targetgroups | Where-Object -Property targetgroupname -eq $($lbhashtable.TargetGroupName)
+    if ($targetgroup) {
+        write-output "Successfully Created Target Group $($targetgroup.TargetGroupName)"
+    }
+    
+    #Adjust Attributes
+    $tgattribscriptblock = "aws elbv2 modify-target-group-attributes --target-group-arn $($targetgroup.TargetGroupArn) --attributes Key=deregistration_delay.timeout_seconds,Value=10"
+    try {
+        Invoke-Expression $tgattribscriptblock | out-null
+    }
+    catch {
+        Write-error -Message $PSItem
+    }
+}
+
+
+function new-awslblistener {
+    param(
+    [Parameter(Mandatory=$true)]
+    [PSCustomObject]$lb,
+    [Parameter(Mandatory=$true)]
+    [PSCustomObject]$targetgroup,
+    [Parameter(Mandatory=$true)]
+    [Hashtable]$lbhashtable
+    )
+    
+    #Port 80 Listener
+    $listener80scriptblock = "aws elbv2 create-listener --load-balancer-arn $($currentlbstatus.LoadBalancerArn) --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$($targetgroup.targetgrouparn)" 
+    try {
+        Invoke-Expression $listener80scriptblock | out-null
+    }
+    catch {
+        Write-error -Message $PSItem
+    }
+    #Port App Listener Port
+    $listenerCustscriptblock= "aws elbv2 create-listener --load-balancer-arn $($currentlbstatus.LoadBalancerArn) --protocol $($lbhashtable.TargetGroupHcheckProto) --port $($lbhashtable.TargetGroupPort) --default-actions Type=forward,TargetGroupArn=$($targetgroup.targetgrouparn)"
+    try {
+        Invoke-Expression $listenerCustscriptblock | out-null
+    }
+    catch {
+        Write-error -Message $PSItem
+    }
+    
+    #Confirm Successful
+    $listenerstatus = (aws elbv2 describe-listeners --load-balancer-arn $($currentlbstatus.LoadBalancerArn) | convertfrom-json).listeners
+    if ($listenerstatus.count -ne 2) {
+        write-error "Expected Two Listeners, found $($listenerstatus.count)"
+    } 
+    else {
+        write-output "Successfully Applied Listener"
+    }
+}
+
+#Main Script
+
+#Collect all LB status and filter - Due to --name filtering throwing a terminating error in powershell 
+$currentlbstatus = (aws elbv2 describe-load-balancers | convertfrom-json).loadbalancers | Where-Object -Property loadbalancername -eq $lbname
+$targetgroup = (aws elbv2 describe-target-groups | convertfrom-json).targetgroups | Where-Object -Property targetgroupname -eq $($lbhashtable.TargetGroupName)
+
+#Determine Subnet if not supplied
+if (!$subnets) {
+    $dhcpsubnets = (aws ec2 describe-subnets | convertfrom-json).Subnets | Where-Object {$_.tags.Value -like "*dhcp*"}
+    if (($dhcpsubnets.vpcid | Select-Object -Unique).count -gt 1) {
+        write-error "Multiple DHCP supported VPC's found - unable to determine subnets, please use -subnet parameter"
+    }
+    foreach ($dhcpsubnet in $dhcpsubnets) {
+        $subnets += "$($dhcpsubnet.subnetid) "
+    }
+}
+
+#Get VPC id if not supplied
+if (!$vpcid) {
+    $awssubnets = (aws ec2 describe-subnets | convertfrom-json).subnets
+    $subnettest = $subnets.Split(', ')[0]
+    foreach ($awssubnet in $awssubnets) {
+        if ($subnettest -eq $($awssubnet.SubnetId)) {
+            $vpcid = $($awssubnet.vpcid)
+        }
+    }
+    if (!$vpcid) {
+        write-error "Unable to determine VPCID"
+    }
+}
+
+
+#Test for Load Balancer, Build if required
+if ($currentlbstatus) {
+    write-output "Load Balancer $lbname already exists - skippping creation"
+}
+else {
+    write-output "Load Balancer $lbname Not found - Attempting creation"
+    new-awsintlb -lbname $lbname -subnets $subnets -securitygroup $securitygroup
+    $newlb = "true"
+}
+
+#Test for Target Group, Build if required
+$currentlbstatus = (aws elbv2 describe-load-balancers | convertfrom-json).loadbalancers | Where-Object -Property loadbalancername -eq $lbname
+
+#Update Health Check Required?
+if ($lbhashtable.TargetGroupPath -ne $targetgroup.HealthCheckPath -and $newlb -ne "true") {
+    write-output "Target group $($targetgroup.TargetGroupName) already exists - however wrong health path - Updating"
+    aws elbv2 modify-target-group --target-group-arn $($targetgroup.TargetGroupArn) --health-check-path $($lbhashtable.TargetGroupPath) | out-null
+    new-awstargetgroup -lb $currentlbstatus -lbhashtable $lbhashtable -vpcid $vpcid
+
+    #Test update worked
+    $targetgroup = (aws elbv2 describe-target-groups | convertfrom-json).targetgroups | Where-Object -Property targetgroupname -eq $($lbhashtable.TargetGroupName)
+    if ($lbhashtable.TargetGroupPath -eq $targetgroup.HealthCheckPath) {
+    write-output "Successfully updated health check path" }
+    else {
+    write-error "Failed to update health check path"
+    }
+}
+
+elseif($currentlbstatus -and $targetgroup) {
+    write-output "Target group $($targetgroup.TargetGroupName) already exists - skipping creation"
+}
+elseif ($currentlbstatus -and !$targetgroup) {
+    write-output "Target group $($targetgroup.TargetGroupName) not found - Attempting creation"
+    new-awstargetgroup -lb $currentlbstatus -lbhashtable $lbhashtable -vpcid $vpcid
+}
+
+
+#Test for listener, build if required
+$targetgroup = (aws elbv2 describe-target-groups | convertfrom-json).targetgroups | Where-Object -Property targetgroupname -eq $($lbhashtable.TargetGroupName)
+$listenerstatus = (aws elbv2 describe-listeners --load-balancer-arn $($currentlbstatus.LoadBalancerArn) | convertfrom-json).listeners
+
+if ($currentlbstatus -and $targetgroup -and ($listenerstatus.count -eq 2)) {
+    write-output "Listners for $($currentlbstatus.LoadBalancerName) already exists - skipping creation"
+}
+elseif ($currentlbstatus -and $targetgroup -and !$listenerstatus) {
+    write-output "Listners for $($currentlbstatus.LoadBalancerName) not found - Attempting creation"
+    new-awslblistener -lb $currentlbstatus -targetgroup $targetgroup -lbhashtable $lbhashtable
+}
+
+###################LB name is required as a parameter in creating ECS service#########################
+$TargetGroupArn = $targetgroup.TargetGroupArn
+
+if ($TargetGroupArn) {
+    write-output "Generating varible targetgrouparn-$appname"
+    Write-host "##vso[task.setvariable variable=targetgrouparn-$appname]$TargetGroupArn"
+}
+else {
+    write-error "Unable to set variable targetgrouparn-$appname"
+}
